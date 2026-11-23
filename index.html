@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="拨动星尘，在指尖点燃烟花。">
+<title>指尖星河</title>
+<style>
+:root{color-scheme:dark;font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif;background:#090a15;color:#f3f1ff}
+*{box-sizing:border-box}body{margin:0}canvas{position:fixed;inset:0;width:100%;height:100%;touch-action:none}
+main{position:relative;pointer-events:none;min-height:100svh;padding:clamp(22px,5vw,75px);display:flex;flex-direction:column;justify-content:space-between;gap:32px}
+h1{font-size:clamp(38px,7vw,88px);font-weight:500;letter-spacing:.13em;margin:8px 0 12px;line-height:1.16}
+.eyebrow{font-size:13px;letter-spacing:.35em;color:#b5a9ec}.intro{color:#c9c4df;margin:0;font-size:16px;line-height:1.7}
+.panel{pointer-events:auto;align-self:flex-start;background:#131426e8;border:1px solid #a699e538;border-radius:18px;padding:17px 20px;max-width:100%;box-shadow:0 12px 50px #05051288}
+.controls{display:flex;flex-wrap:wrap;gap:8px}button{font:inherit;font-size:14px;border:1px solid #a699e54d;background:#242440;border-radius:8px;padding:9px 13px;color:inherit;cursor:pointer}button.primary{background:#d1c4ff;color:#1c1530;border-color:#d1c4ff}button:disabled{opacity:.55;cursor:wait}button:focus-visible{outline:2px solid #fff;outline-offset:3px}
+#status,.hint{font-size:14px;color:#c9c4df;margin:10px 0 0;line-height:1.55}#status{min-height:1.55em}.hint{margin-bottom:12px}
+video{position:fixed;bottom:clamp(22px,5vw,75px);right:clamp(22px,5vw,75px);width:clamp(90px,18vw,165px);aspect-ratio:4/3;object-fit:cover;transform:scaleX(-1);border:1px solid #a699e588;border-radius:14px;background:#111}
+@media(max-width:650px){video{top:160px;bottom:auto}} 
+</style>
+</head>
+<body>
+<canvas aria-hidden="true"></canvas>
+<main>
+<header><div class="eyebrow" lang="en">FINGERTIP SKY</div><h1>指尖星河</h1><p class="intro">拨动星尘，在指尖点燃烟花。</p></header>
+<section class="panel" aria-label="互动控制">
+<p class="hint">移动食指拨星尘，五指张开放烟花。<br>拇指与食指捏合聚星，握拳蓄光。<br>也可以移动鼠标、点击画面，或按下「放烟花」。</p>
+<div class="controls"><button type="button" id="camera" class="primary">开启摄像头</button><button type="button" id="fire">放烟花</button></div>
+<p id="status" role="status">鼠标模式 · 摄像头关闭</p>
+</section>
+</main>
+<video playsinline muted hidden></video>
+<script type="module">
+const canvas = document.querySelector('canvas');
+const ctx = canvas.getContext('2d');
+const camera = document.querySelector('#camera');
+const fire = document.querySelector('#fire');
+const video = document.querySelector('video');
+const status = document.querySelector('#status');
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const colors = ['#c4b6ff','#72d9ff','#f5aadb','#fff2cc','#797eff'];
+let width, height, stars = [], sparks = [];
+const gestureLabels = {
+  move:'移动食指 · 拨动星尘', open:'五指张开 · 烟花绽放',
+  pinch:'捏合 · 星尘聚拢', fist:'握拳 · 星光聚集'
+};
+let hand = null, mouse = null, gesture = 'move', candidate = 'move';
+let candidateFrames = 0, lastHandTime = -Infinity, charge = 0, chargePoint = null;
+let trailAnchor = null;
+let fingertip = null, flowPoint = null, trail = [], rings = [], lastFrame = 0;
+let tracker, modelPromise, stream, lastVideoTime = -1, lastDetection = 0;
+
+function resize() {
+  const ratio = Math.min(devicePixelRatio || 1, 2);
+  width = innerWidth;
+  height = innerHeight;
+  canvas.width = Math.round(width * ratio);
+  canvas.height = Math.round(height * ratio);
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  stars = Array.from({length: Math.min(850, Math.max(220, Math.floor(width * height / 1400)))}, (_, i) => {
+    const angle = Math.random() * Math.PI * 2;
+    const radius = Math.pow(Math.random(), .76) * Math.min(width * .65, height * .8);
+    const a = Math.cos(angle + radius * .003) * radius;
+    const b = Math.sin(angle + radius * .003) * radius * .32;
+    const band = i % 4 !== 0;
+    const x = band ? width * .56 + a * .83 - b * .55 : Math.random() * width;
+    const y = band ? height * .49 + a * .55 + b * .83 : Math.random() * height;
+    return {x,y,homeX:x,homeY:y,vx:0,vy:0,r:.4 + Math.random() ** 3 * 2.4,phase:Math.random()*8,color:colors[i % colors.length]};
+  });
+}
+addEventListener('resize', resize);
+resize();
+
+function burst(x,y) {
+  const colorOffset = Math.floor(Math.random() * colors.length);
+  const count = reducedMotion ? 28 : 132;
+  const phase = Math.random() * Math.PI * 2;
+  if (!reducedMotion) {
+    rings.push({x,y,age:0,color:colors[colorOffset]});
+    if (rings.length > 10) rings.shift();
+  }
+  for (let i = 0; i < count; i++) {
+    const layer = i / count;
+    const outer = layer < .52;
+    const angle = phase + i * 2.39996;
+    const speed = outer ? 4.8 + Math.random() * 2.8 : 1.1 + Math.random() * 3;
+    sparks.push({
+      x,y,vx:Math.cos(angle)*speed,vy:Math.sin(angle)*speed,
+      life:1,decay:outer ? .013+Math.random()*.006 : .017+Math.random()*.016,
+      color:layer > .80 ? '#fff2cc' : colors[(colorOffset + Number(!outer)) % colors.length],
+      streak:outer ? 2.8 : 1.3, phase:Math.random()*10, glitter:layer > .68
+    });
+  }
+  if (sparks.length > 1000) sparks.splice(0, sparks.length - 1000);
+}
+
+function classifyGesture(points, frameWidth, frameHeight, current) {
+  const distance = (a,b) => Math.hypot(
+    (points[a].x-points[b].x)*frameWidth,
+    (points[a].y-points[b].y)*frameHeight
+  );
+  const scale = Math.max(1,distance(0,9),distance(5,17));
+  const fingers = [5,9,13,17];
+  const extended = fingers.filter(base => {
+    const length = distance(base,base+1)+distance(base+1,base+2)+distance(base+2,base+3);
+    return distance(base,base+3) > .86*length &&
+      distance(0,base+3) > distance(0,base+1)+scale*.2;
+  }).length;
+  const thumbSpread = distance(4,5)/scale;
+  const compact = fingers.every(base => distance(base+3,9) < scale*.86);
+  if (extended === 0 && compact) return 'fist';
+  if (distance(4,8)/scale < (current === 'pinch' ? .35 : .24)) return 'pinch';
+  if (extended === 4 && thumbSpread > (current === 'open' ? .38 : .51)) return 'open';
+  return 'move';
+}
+
+function updateHand(now) {
+  if (!stream || !tracker || video.readyState < 2 || now-lastDetection < 40 || video.currentTime === lastVideoTime) return;
+  lastDetection = now;
+  lastVideoTime = video.currentTime;
+  const points = tracker.detectForVideo(video, now).landmarks[0];
+  if (!points) {
+    if (hand) status.textContent = '摄像头已开启 · 把手伸进画面';
+    hand = null;
+    candidateFrames = 0;
+    if (now-lastHandTime > 250) gesture = 'move';
+    return;
+  }
+  const wasTracking = Boolean(hand);
+  lastHandTime = now;
+  const toCanvas = point => ({x:(1-point.x)*width,y:point.y*height});
+  const palm = toCanvas(points[9]);
+  const next = classifyGesture(points,video.videoWidth,video.videoHeight,gesture);
+  if (next === candidate) {
+    candidateFrames = Math.min(3,candidateFrames+1);
+  } else {
+    candidate = next;
+    candidateFrames = 1;
+  }
+  if (candidateFrames === 3 && gesture !== candidate) {
+    gesture = candidate;
+    if (gesture === 'open') burst(palm.x,palm.y);
+    status.textContent = gestureLabels[gesture];
+  } else if (!wasTracking) {
+    status.textContent = gestureLabels[gesture];
+  }
+  const tip = points[8], thumb = points[4];
+  hand = gesture === 'fist' ? palm : toCanvas(gesture === 'pinch' ?
+    {x:(tip.x+thumb.x)/2,y:(tip.y+thumb.y)/2} : tip);
+}
+
+function updatePointer(now, step) {
+  if (hand) {
+    fingertip ??= {...hand};
+    const blend = 1 - Math.exp(-step * .33);
+    fingertip.x += (hand.x-fingertip.x)*blend;
+    fingertip.y += (hand.y-fingertip.y)*blend;
+    if (!reducedMotion && gesture !== 'fist') {
+      trailAnchor ??= {...fingertip};
+      const dx = fingertip.x-trailAnchor.x, dy = fingertip.y-trailAnchor.y;
+      const distance = Math.hypot(dx,dy);
+      const count = Math.min(10,Math.floor(distance/5));
+      for (let i = 1; i <= count; i++) {
+        const t = i/count;
+        trail.push({
+          x:trailAnchor.x+dx*t+(Math.random()-.5)*8,
+          y:trailAnchor.y+dy*t+(Math.random()-.5)*8,
+          vx:(Math.random()-.5)*15,vy:(Math.random()-.5)*15,time:now,
+          life:360+Math.random()*310,r:.45+Math.random()**2*1.8,
+          color:colors[Math.floor(Math.random()*colors.length)]
+        });
+      }
+      if (count) trailAnchor = {...fingertip};
+    } else {
+      trailAnchor = null;
+    }
+  } else {
+    fingertip = null;
+    trailAnchor = null;
+  }
+  trail = trail.filter(dot => now-dot.time < dot.life).slice(-210);
+  charge += ((fingertip && gesture === 'fist' ? 1 : 0)-charge)*(1-Math.exp(-step*.08));
+  if (fingertip && gesture === 'fist') chargePoint = {...fingertip};
+
+  const target = fingertip || mouse;
+  const source = fingertip ? 'hand' : 'mouse';
+  if (!target) {
+    flowPoint = null;
+    return;
+  }
+  if (flowPoint?.source !== source) flowPoint = {...target,vx:0,vy:0,source};
+  const blend = 1 - Math.exp(-step * .28);
+  const dx = (target.x-flowPoint.x)*blend;
+  const dy = (target.y-flowPoint.y)*blend;
+  flowPoint.x += dx;
+  flowPoint.y += dy;
+  flowPoint.vx += (dx/step-flowPoint.vx)*blend;
+  flowPoint.vy += (dy/step-flowPoint.vy)*blend;
+}
+
+function drawTrail(now) {
+  for (const dot of trail) {
+    const age = now-dot.time;
+    const fade = (1-age/dot.life)**1.65;
+    const x = dot.x+dot.vx*age/1000, y = dot.y+dot.vy*age/1000;
+    ctx.fillStyle = dot.color;
+    ctx.globalAlpha = fade*.12;
+    ctx.beginPath();
+    ctx.arc(x,y,dot.r*3,0,Math.PI*2);
+    ctx.fill();
+    ctx.globalAlpha = fade*.82;
+    ctx.beginPath();
+    ctx.arc(x,y,dot.r,0,Math.PI*2);
+    ctx.fill();
+    if (dot.r > 1.7) {
+      ctx.globalAlpha *= .52;
+      ctx.fillRect(x-dot.r*2,y-.4,dot.r*4,.8);
+      ctx.fillRect(x-.4,y-dot.r*2,.8,dot.r*4);
+    }
+  }
+}
+
+function drawCharge(now) {
+  if (!chargePoint || charge < .02) return;
+  const {x,y} = chargePoint;
+  const glow = ctx.createRadialGradient(x,y,0,x,y,12+38*charge);
+  glow.addColorStop(0,'#fff2cc');
+  glow.addColorStop(.3,'#eab67c88');
+  glow.addColorStop(1,'#eab67c00');
+  ctx.globalAlpha = charge*.75;
+  ctx.fillStyle = glow;
+  ctx.fillRect(x-53,y-53,106,106);
+  if (reducedMotion) return;
+  for (let i = 0; i < 19; i++) {
+    const angle = now*.003+i*2.39996;
+    const radius = (18+i*1.3)*(1.18-charge*.36);
+    ctx.fillStyle = colors[i%colors.length];
+    ctx.globalAlpha = charge*(.52+.22*Math.cos(angle+i));
+    ctx.beginPath();
+    ctx.arc(x+Math.cos(angle)*radius,y+Math.sin(angle)*radius*.58,1+(i%3)*.35,0,Math.PI*2);
+    ctx.fill();
+  }
+}
+
+function draw(now) {
+  requestAnimationFrame(draw);
+  try {
+    updateHand(now);
+  } catch {
+    stopCamera('手势识别中断 · 可重新开启摄像头');
+  }
+  const step = lastFrame ? Math.min(2,Math.max(.1,(now-lastFrame)/16.67)) : 1;
+  lastFrame = now;
+  updatePointer(now, step);
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  const sky = ctx.createRadialGradient(width*.56,height*.49,0,width*.56,height*.49,Math.max(width,height)*.62);
+  sky.addColorStop(0,'#211b3b');
+  sky.addColorStop(.6,'#0c1022');
+  sky.addColorStop(1,'#080911');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0,0,width,height);
+  ctx.globalCompositeOperation = 'lighter';
+  const point = flowPoint;
+  const gathering = fingertip && gesture === 'pinch';
+  const speed = point ? Math.hypot(point.vx,point.vy) : 0;
+  const speedLimit = Math.min(1,12/Math.max(speed,1));
+  const radius = Math.min(165,Math.max(90,width*.23));
+  const damping = .91 ** step;
+  for (const star of stars) {
+    star.vx += (star.homeX-star.x)*.0032*step;
+    star.vy += (star.homeY-star.y)*.0032*step;
+    if (point && (speed > .04 || gathering) && !reducedMotion) {
+      const dx = star.x-point.x, dy = star.y-point.y;
+      const weight = Math.max(0,1-(dx*dx+dy*dy)/(radius*radius)) ** 2;
+      if (gathering) {
+        star.vx -= dx*weight*.015*step;
+        star.vy -= dy*weight*.015*step;
+      }
+      const drift = weight*step*speedLimit;
+      const curl = (dx*point.vy-dy*point.vx)/(radius*radius);
+      star.vx += (point.vx*.084-dy*curl*.055)*drift;
+      star.vy += (point.vy*.084+dx*curl*.055)*drift;
+    }
+    star.vx *= damping;
+    star.vy *= damping;
+    star.x += star.vx*step;
+    star.y += star.vy*step;
+    ctx.globalAlpha = reducedMotion ? .63 : .60 + .29*Math.sin(now*.0016+star.phase);
+    ctx.fillStyle = star.color;
+    ctx.beginPath();
+    ctx.arc(star.x,star.y,star.r,0,Math.PI*2);
+    ctx.fill();
+    if (star.r > 2.1) {
+      ctx.globalAlpha *= .42;
+      ctx.fillRect(star.x-star.r*2.8,star.y-.35,star.r*5.6,.7);
+      ctx.fillRect(star.x-.35,star.y-star.r*2.8,.7,star.r*5.6);
+    }
+  }
+  for (const ring of rings) {
+    const progress = Math.min(1,ring.age/26);
+    ctx.globalAlpha = (1-progress)**2*.28;
+    ctx.strokeStyle = ring.color;
+    ctx.lineWidth = 1.15;
+    ctx.beginPath();
+    ctx.arc(ring.x,ring.y,5+85*(1-(1-progress)**2),0,Math.PI*2);
+    ctx.stroke();
+    ring.age += step;
+  }
+  rings = rings.filter(ring => ring.age < 26);
+
+  for (const spark of sparks) {
+    if (spark.life <= 0) continue;
+    const glow = spark.glitter && !reducedMotion ? .62+.38*Math.sin(now*.024+spark.phase) : 1;
+    ctx.globalAlpha = spark.life**1.3*glow;
+    ctx.strokeStyle = spark.color;
+    ctx.lineWidth = spark.glitter ? 1 : 1.65;
+    ctx.beginPath();
+    ctx.moveTo(spark.x-spark.vx*spark.streak,spark.y-spark.vy*spark.streak);
+    ctx.lineTo(spark.x,spark.y);
+    ctx.stroke();
+    if (spark.glitter && glow > .85) {
+      ctx.fillStyle = spark.color;
+      ctx.fillRect(spark.x-1,spark.y-1,2,2);
+    }
+    spark.x += spark.vx*step;
+    spark.y += spark.vy*step;
+    spark.vx *= .979 ** step;
+    spark.vy = spark.vy*.979 ** step + .065*step;
+    spark.life -= spark.decay*step;
+  }
+  sparks = sparks.filter(spark => spark.life > 0);
+  drawTrail(now);
+  drawCharge(now);
+  if (fingertip) {
+    const {x,y} = fingertip;
+    ctx.globalAlpha = .72;
+    ctx.strokeStyle = '#e1d4ff';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(x,y,gesture === 'pinch' ? 8 : 13,0,Math.PI*2);
+    ctx.stroke();
+    ctx.fillStyle = '#f5ecff';
+    ctx.fillRect(x-1.2,y-1.2,2.4,2.4);
+  }
+}
+
+canvas.addEventListener('pointermove', event => { mouse = {x:event.clientX,y:event.clientY}; });
+canvas.addEventListener('pointerleave', () => { mouse = null; });
+canvas.addEventListener('pointerdown', event => { burst(event.clientX,event.clientY); });
+fire.addEventListener('click', () => burst(width*.56,height*.46));
+
+function loadTracker() {
+  modelPromise ??= (async () => {
+    const base = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21';
+    const {FilesetResolver,HandLandmarker} = await import(base + '/vision_bundle.mjs');
+    const files = await FilesetResolver.forVisionTasks(base+'/wasm');
+    return HandLandmarker.createFromOptions(files,{
+      baseOptions:{modelAssetPath:'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task'},
+      runningMode:'VIDEO',numHands:1
+    });
+  })().catch(error => { modelPromise = null; throw error; });
+  return modelPromise;
+}
+
+function stopCamera(message='鼠标模式 · 摄像头关闭') {
+  const previous = stream;
+  stream = null;
+  previous?.getTracks().forEach(track => track.stop());
+  video.srcObject = null;
+  video.hidden = true;
+  hand = null;
+  fingertip = null;
+  trail = [];
+  gesture = candidate = 'move';
+  candidateFrames = 0;
+  lastHandTime = -Infinity;
+  trailAnchor = null;
+  charge = 0;
+  chargePoint = null;
+  lastVideoTime = -1;
+  camera.textContent = '开启摄像头';
+  status.textContent = message;
+}
+camera.addEventListener('click', async () => {
+  if (stream) { stopCamera(); return; }
+  camera.disabled = true;
+  status.textContent = '等待摄像头授权…';
+  let loadingModel = false;
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error('unavailable');
+    stream = await navigator.mediaDevices.getUserMedia({video:{width:{ideal:640},height:{ideal:480},facingMode:'user'},audio:false});
+    const activeStream = stream;
+    activeStream.getVideoTracks()[0].addEventListener('ended', () => {
+      if (stream === activeStream) stopCamera('摄像头已断开 · 可继续用鼠标');
+    });
+    video.srcObject = activeStream;
+    await video.play();
+    video.hidden = false;
+    loadingModel = true;
+    status.textContent = '正在加载手势识别…';
+    tracker = await loadTracker();
+    if (stream !== activeStream) return;
+    camera.textContent = '关闭摄像头';
+    status.textContent = '摄像头已开启 · 把手伸进画面';
+  } catch (error) {
+    stopCamera(loadingModel ? '手势模型加载失败 · 检查网络后重试' :
+      error.name === 'NotAllowedError' ? '摄像头未授权 · 可继续用鼠标' :
+      '无法打开摄像头 · 可继续用鼠标');
+  } finally {
+    camera.disabled = false;
+  }
+});
+addEventListener('pagehide', () => stopCamera());
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
